@@ -176,7 +176,7 @@ class DINOv2(torch.nn.Module):
     def __init__(self, cv_type='adv'):
         super().__init__()
         self.cv_type = cv_type
-        self.model = torch.hub.load('/path/to/external/models/dinov2', 'dinov2_vitl14', source='local')
+        self.model = torch.hub.load('./InstantRestore/dinov2', 'dinov2_vitl14', source='local')
         self.model.eval()
         self.model.requires_grad = False
         self.input_resolution = 224

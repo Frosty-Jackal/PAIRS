@@ -80,10 +80,11 @@ class Coach:
         self.model = self.init_model()
 
         if self.cfg.model.net_type == "pix2pix_turbo":
-            if self.cfg.optim.enable_xformers_memory_efficient_attention and is_xformers_available():
-                self.model.net.unet.enable_xformers_memory_efficient_attention()
-            elif not is_xformers_available():
-                raise ValueError("xformers is not available, please install it by running `pip install xformers`")
+            if self.cfg.optim.enable_xformers_memory_efficient_attention:
+                if is_xformers_available():
+                    self.model.net.unet.enable_xformers_memory_efficient_attention()
+                else:
+                    raise ValueError("xformers is not available, please install it by running `pip install xformers`")
             else:
                 print("Not enabling xformers memory efficient attention")
 
@@ -92,9 +93,20 @@ class Coach:
 
         self.net_disc = self.init_discriminator()
         self.net_lpips = self.init_loss_networks()
-        self.id_loss = IDLoss(pretrained_arcface_path='path/to/external/models/model_ir_se50.pth',
+        self.id_loss = IDLoss(pretrained_arcface_path='./external_models/model_ir_se50.pth',
                               device=self.accelerator.device,
                               dtype=torch.float32)
+
+        self.weight_dtype = torch.float32
+        if self.accelerator.mixed_precision == "fp16":
+            self.weight_dtype = torch.float16
+        elif self.accelerator.mixed_precision == "bf16":
+            self.weight_dtype = torch.bfloat16
+        print(f"Using weight type: {self.weight_dtype}")
+
+        self.model.net.to(self.accelerator.device, dtype=self.weight_dtype)
+        self.net_disc.to(self.accelerator.device, dtype=self.weight_dtype)
+        self.net_lpips.to(self.accelerator.device, dtype=self.weight_dtype)
 
         self.optimizer, self.lr_scheduler, self.optimizer_disc, self.lr_scheduler_disc, self.layers_to_opt = self.init_optimizer()
         if self.cfg.model.checkpoint_path is not None:
@@ -127,18 +139,6 @@ class Coach:
         ) = self.accelerator.prepare(*components_to_prepare)
 
         self.net_lpips, self.id_loss = self.accelerator.prepare(self.net_lpips, self.id_loss)
-
-        self.weight_dtype = torch.float32
-        if self.accelerator.mixed_precision == "fp16":
-            self.weight_dtype = torch.float16
-        elif self.accelerator.mixed_precision == "bf16":
-            self.weight_dtype = torch.bfloat16
-
-        print(f"Using weight type: {self.weight_dtype}")
-
-        self.model.net.to(self.accelerator.device, dtype=self.weight_dtype)
-        self.net_disc.to(self.accelerator.device, dtype=self.weight_dtype)
-        self.net_lpips.to(self.accelerator.device, dtype=self.weight_dtype)
 
         if self.accelerator.is_main_process:
             tracker_config = dataclasses.asdict(self.cfg)
@@ -467,7 +467,8 @@ class Coach:
                                       lr=self.cfg.optim.learning_rate,
                                       betas=(self.cfg.optim.adam_beta1, self.cfg.optim.adam_beta2),
                                       weight_decay=self.cfg.optim.adam_weight_decay,
-                                      eps=self.cfg.optim.adam_epsilon)
+                                      eps=self.cfg.optim.adam_epsilon,
+                                      foreach=False)
         lr_scheduler = get_scheduler(name=self.cfg.optim.scheduler_type.value,
                                      optimizer=optimizer,
                                      num_warmup_steps=self.cfg.optim.lr_warmup_steps * self.accelerator.num_processes,
@@ -479,7 +480,8 @@ class Coach:
                                            lr=self.cfg.optim.learning_rate,
                                            betas=(self.cfg.optim.adam_beta1, self.cfg.optim.adam_beta2),
                                            weight_decay=self.cfg.optim.adam_weight_decay,
-                                           eps=self.cfg.optim.adam_epsilon)
+                                           eps=self.cfg.optim.adam_epsilon,
+                                           foreach=False)
         lr_scheduler_disc = get_scheduler(self.cfg.optim.scheduler_type.value,
                                           optimizer=optimizer_disc,
                                           num_warmup_steps=self.cfg.optim.lr_warmup_steps * self.accelerator.num_processes,

@@ -1,3 +1,7 @@
+import os
+os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
 import torch
 import pyrallis
 import cv2

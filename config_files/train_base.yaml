@@ -23,8 +23,8 @@ optim:
   compute_id_loss_between_identities: false
   mixed_precision: true
 data:
-  data_root: D:/datasets/CelebRefHQHR/train
-  val_data_root: D:/datasets/CelebRefHQHR/test/x8
+  data_root: ./CelebRefHQHR/train
+  val_data_root: ./CelebRefHQHR/val
   dataset_type: face_restore
   max_conditioning_images: 4
   store_landmarks: false
@@ -41,8 +41,8 @@ model:
   train_input: false
   checkpoint_path: null
 log:
-  exp_root: path/to/experiments
-  exp_name: exp_name
+  exp_root: ./experiments
+  exp_name: base_adain
   log2wandb: true
   val_vis_count: 50
   vis_attention: false
