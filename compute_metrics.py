@@ -22,6 +22,7 @@ Output files (written under --output-dir):
 import argparse
 import csv
 import sys
+import time
 from glob import glob
 from pathlib import Path
 
@@ -201,6 +202,8 @@ def main():
     data_root = Path(args.data_root)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    samples_dir = output_dir / "samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     dtype = torch.float16 if device.type == "cuda" else torch.float32
@@ -271,10 +274,23 @@ def main():
         print(f"Limited to {len(samples)} samples (--max-samples={args.max_samples}).")
     print()
 
+    # --- Select 9 evenly-spaced indices for qualitative results (deterministic) ---
+    _n_total = len(samples)
+    if _n_total <= 9:
+        _qualitative_indices = set(range(_n_total))
+    else:
+        _qualitative_indices = set(
+            int(round(i)) for i in np.linspace(0, _n_total - 1, 9)
+        )
+    print(f"Qualitative samples: will save {len(_qualitative_indices)} groups "
+          f"(indices: {sorted(_qualitative_indices)})")
+    print()
+
     # ------------------------------------------------------------------
     # 5. Evaluate
     # ------------------------------------------------------------------
     all_results = []                                          # list of dicts (per-sample)
+    runtime_records = []                                      # per-sample inference time (seconds)
     scale_scores = {m: {s: [] for s in scales} for m in enabled if m != "params"}
 
     for idx, (scale, identity, img_dir) in enumerate(samples):
@@ -302,7 +318,9 @@ def main():
         conds_t = preprocess_conds(ref_pils, transform)
         valid = torch.tensor([MAX_COND_IMAGES], dtype=torch.int)
 
-        # --- inference ---
+        # --- inference (timed) ---
+        torch.cuda.synchronize() if device.type == "cuda" else None
+        t_start = time.time()
         with torch.no_grad():
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
                 x_pred, _, _ = model.net.forward(
@@ -310,6 +328,21 @@ def main():
                     conditioning_images=conds_t.to(device, dtype),
                     valid_indices=valid,
                 )
+        torch.cuda.synchronize() if device.type == "cuda" else None
+        t_elapsed = time.time() - t_start
+        runtime_records.append(t_elapsed)
+
+        # --- save sample images (only for 9 qualitative picks) ---
+        if idx in _qualitative_indices:
+            sample_tag = f"{idx+1:04d}_{scale}_{identity}_{img_dir.name}"
+            # ① degraded (low-res input)
+            Image.open(degraded_path).save(samples_dir / f"{sample_tag}_01_degraded.png")
+            # ② reference (conditioning) images
+            for ri, rp in enumerate(ref_pils):
+                rp.save(samples_dir / f"{sample_tag}_02_reference_{ri+1}.png")
+            # ③ output (restored)
+            out_uint8 = tensor_to_uint8(x_pred)
+            Image.fromarray(out_uint8).save(samples_dir / f"{sample_tag}_03_output.png")
 
         # x_pred in [-1, 1], (1, 3, 512, 512)
         gt_pil = load_image(gt_path)
@@ -434,6 +467,14 @@ def main():
                     continue
                 f.write(f"    {scale}:  {np.mean(vals):.6f} ± {np.std(vals):.6f}  (n={len(vals)})\n")
 
+        # Runtime summary
+        if runtime_records:
+            avg_rt = np.mean(runtime_records)
+            std_rt = np.std(runtime_records)
+            f.write(f"\nAverage inference runtime: {avg_rt:.4f} ± {std_rt:.4f} s  "
+                    f"(over {len(runtime_records)} samples, min={np.min(runtime_records):.4f}s, "
+                    f"max={np.max(runtime_records):.4f}s)\n\n")
+
         # Table-ready one-liners
         f.write("\n" + "=" * 65 + "\n")
         f.write("Table-ready one-liners:\n")
@@ -445,6 +486,9 @@ def main():
             f.write(f"  {metric_name.upper()} = {np.mean(all_vals):{fmt}}\n")
         if params_info:
             f.write(f"  Params = {params_info['total']:,} (trainable: {params_info['trainable']:,})\n")
+        if runtime_records:
+            avg_rt = np.mean(runtime_records)
+            f.write(f"  Avg Inference Time = {avg_rt:.4f} s  (n={len(runtime_records)})\n")
 
     print(f"Overall summary  → {overall_txt}")
 
@@ -458,7 +502,14 @@ def main():
         print(f"Overall {metric_name.upper()}:  {np.mean(all_vals):.6f} ± {np.std(all_vals):.6f}")
     if params_info:
         print(f"Params — Total: {params_info['total']:,}  Trainable: {params_info['trainable']:,}")
+    if runtime_records:
+        avg_rt = np.mean(runtime_records)
+        std_rt = np.std(runtime_records)
+        print(f"\nAverage inference runtime: {avg_rt:.4f} ± {std_rt:.4f} s  "
+              f"(over {len(runtime_records)} samples, min={np.min(runtime_records):.4f}s, "
+              f"max={np.max(runtime_records):.4f}s)")
     print("=" * 65)
+    print(f"Sample images saved to: {samples_dir}")
     print("Done.")
 
 

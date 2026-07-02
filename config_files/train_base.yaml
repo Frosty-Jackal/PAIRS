@@ -19,14 +19,15 @@ optim:
   lambda_neg_reg: 0.0
   lambda_facial_comp: 0.0
   gan_disc_type: dinov2
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 3
   compute_id_loss_between_identities: false
   mixed_precision: true
+  gradient_checkpointing: true
 data:
   data_root: ./CelebRefHQHR/train
   val_data_root: ./CelebRefHQHR/val
   dataset_type: face_restore
-  max_conditioning_images: 4
+  max_conditioning_images: 3
   store_landmarks: false
 model:
   net_type: pix2pix_turbo
@@ -39,16 +40,16 @@ model:
   use_shortcuts: false
   use_adain: true
   train_input: false
-  checkpoint_path: null
+  checkpoint_path: ./InstantRestore/final_model_ckpt.pt
 log:
   exp_root: ./experiments
-  exp_name: base_adain
+  exp_name: base_InstantRestore
   log2wandb: true
   val_vis_count: 50
   vis_attention: false
 steps:
-  max_steps: 50000
-  image_interval: 150
+  max_steps: 5002
+  image_interval: 250
   metric_interval: 10
   val_interval: 250
-  save_interval: 500
+  save_interval: 2500
