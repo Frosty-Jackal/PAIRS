@@ -2,7 +2,7 @@
 # PAIRS — Combined config: L_ICA + Set-based Identity Encoding
 # ═══════════════════════════════════════════════════════════════════
 # Idea 2 (L_ICA): K-semantic weighted attention consistency loss
-# Idea 3 (Set Encoding): PMA-based permutation-invariant identity encoding
+# Idea 3 (PIE):  Permutation-Invariant Identity Encoding
 # ═══════════════════════════════════════════════════════════════════
 
 compute:
@@ -52,7 +52,7 @@ model:
   checkpoint_path: ./InstantRestore/final_model_ckpt.pt
   # ── Set-based Identity Encoding ──────────────────────────────────
   use_set_encoding: true
-  set_encoding_num_inducing: 256   # M=256 inducing points for PMA
+  set_encoding_num_inducing: 256   # M=256 inducing points for PIE
   # up_block indices: leave null to auto-hook all SD-Turbo up_blocks
   set_encoding_up_block_indices: null
 log:

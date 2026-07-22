@@ -21,7 +21,7 @@ import time
 # ═══════════════════════════════════════════════════════════════════
 
 class SetIdentityEncoder(nn.Module):
-    """PMA-based set identity encoder.
+    """PIE (Permutation-Invariant Identity Encoder) — set identity encoder.
 
     Flattens reference ResBlock features across K reference images into an
     unordered set of tokens, compresses them via cross-attention with M
@@ -46,7 +46,7 @@ class SetIdentityEncoder(nn.Module):
         # Learnable inducing points S ∈ R^{M × C}
         self.inducing = nn.Parameter(torch.randn(num_inducing, feat_dim) * 0.02)
 
-        # PMA: cross-attention — S queries, flattened tokens as keys/values
+        # PIE: cross-attention — S queries, flattened tokens as keys/values
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=feat_dim,
             num_heads=num_heads,
@@ -88,7 +88,7 @@ class SetIdentityEncoder(nn.Module):
         # Step 2: concatenate across reference images → [B, K×HW, C]
         tokens = torch.cat(tokens_list, dim=1)  # [B, K*HW, C]
 
-        # Step 3: PMA — inducing points attend to the unordered token set
+        # Step 3: PIE — inducing points attend to the unordered token set
         S = self.inducing.unsqueeze(0).expand(B, -1, -1)  # [B, M, C]
         Z, _ = self.cross_attn(S, tokens, tokens)          # [B, M, C]
 
@@ -122,7 +122,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
 
         self.cfg = cfg
 
-        # ── Set-encoding state ──────────────────────────────────────
+        # ── PIE (Permutation-Invariant Identity Encoding) state ─────
         self._ref_up_block_features: list = []     # captured from Ref UNet
         self._set_deltas: list = []                # computed deltas for Gen UNet
         self._ref_hook_handles: list = []          # forward-hook handles on Ref UNet
@@ -386,7 +386,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
         handle_list.clear()
 
     def _compute_set_deltas(self, batch_size: int):
-        """Run PMA on captured reference features to get per-scale deltas.
+        """Run PIE on captured reference features to get per-scale deltas.
 
         Called once per forward pass, after ``get_conditioning_keys_values``
         has populated ``self._ref_up_block_features``.
@@ -421,7 +421,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
         self._ref_up_block_features = [None] * len(self.original_unet.up_blocks)
 
     # ═══════════════════════════════════════════════════════════════
-    # End Set-encoding helpers
+    # End PIE helpers
     # ═══════════════════════════════════════════════════════════════
 
     def set_eval(self):
@@ -478,7 +478,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
             for n, _p in self.original_vae.named_parameters():
                 _p.requires_grad = False
 
-        # ── Set-encoding parameters always trainable ──────────────
+        # ── PIE parameters always trainable ────────────────────────
         if self.set_encoders:
             self.set_encoders.train()
             for enc in self.set_encoders:
@@ -562,7 +562,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
         # print(f"Preprocessing: {time.time() - start_time}")
         # start_time = time.time()
 
-        # ── Compute set-encoding deltas before Gen UNet forward ──
+        # ── Compute PIE deltas before Gen UNet forward ───────────
         if conditioning_images is not None and self.set_encoders:
             B = c_t.shape[0]
             self._compute_set_deltas(B)
@@ -609,7 +609,7 @@ class Pix2Pix_Turbo(torch.nn.Module):
         sd["rank_vae"] = self.lora_rank_vae
         sd["state_dict_unet"] = {k: v for k, v in self.unet.state_dict().items() if "lora" in k or "conv_in" in k}
         sd["state_dict_vae"] = {k: v for k, v in self.vae.state_dict().items() if "lora" in k or "skip" in k}
-        # ── Set-encoding weights ──────────────────────────────────
+        # ── PIE weights ──────────────────────────────────────────
         if self.set_encoders:
             sd["state_dict_set_encoders"] = {
                 f"set_encoder_{i}": enc.state_dict()
