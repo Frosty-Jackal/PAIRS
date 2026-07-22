@@ -1,2 +1,2 @@
-# HRFR
-Official Implementation of HRFR
+# PAIRS
+Official Implementation of PAIRS
