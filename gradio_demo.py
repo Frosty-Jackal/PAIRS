@@ -108,7 +108,7 @@ class GradioDemo:
                 for self_attn_processor in self_attn_processors:
                     self_attn_processor.save_self_attentions = True
                 
-                x_pred, _, _ = self.face_replace_model.net.forward(
+                x_pred, _, _, _, _ = self.face_replace_model.net.forward(
                     inp_t.to(self.device, self.dtype),
                     conditioning_images=conds_t.to(self.device, self.dtype),
                     valid_indices=valid_indices,

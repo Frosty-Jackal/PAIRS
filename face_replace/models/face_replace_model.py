@@ -18,7 +18,7 @@ class FaceReplaceModel(nn.Module):
             checkpoint_dict['state_dict'] = {k.replace('net.', '', 1) : v for k, v in checkpoint_dict['state_dict'].items()} 
             checkpoint_dict['state_dict'] = {k.replace('module.', '', 1) : v for k, v in checkpoint_dict['state_dict'].items()} 
             # print(checkpoint_dict['state_dict'].keys())
-            out = self.net.load_state_dict(checkpoint_dict['state_dict'], strict=True)
+            out = self.net.load_state_dict(checkpoint_dict['state_dict'], strict=False)
             print(out)
             checkpoint_dict = None
             print("Emptying cache")
@@ -30,8 +30,9 @@ class FaceReplaceModel(nn.Module):
                                 lora_rank_vae=self.cfg.lora_rank_vae,
                                 condition_on_face_embeds=self.cfg.condition_on_face_embeds,
                                 concat_mask_and_landmarks=self.cfg.concat_mask_and_landmarks,
-                                save_self_attentions=self.full_cfg.log.vis_attention or self.full_cfg.optim.lambda_attn_reg > 0 or 
-                                    self.full_cfg.optim.lambda_landmark > 0 or self.full_cfg.optim.lambda_pos_reg > 0 or self.full_cfg.optim.lambda_neg_reg > 0,
+                                save_self_attentions=self.full_cfg.log.vis_attention or self.full_cfg.optim.lambda_attn_reg > 0 or
+                                    self.full_cfg.optim.lambda_landmark > 0 or self.full_cfg.optim.lambda_pos_reg > 0 or self.full_cfg.optim.lambda_neg_reg > 0 or
+                                    self.full_cfg.optim.lambda_ica > 0,
                                 train_reference_networks=self.cfg.train_reference_networks,
                                 cfg=self.cfg)
             net.set_train()

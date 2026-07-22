@@ -47,7 +47,8 @@ class CoachLogger:
     def log_metrics(self, metrics_dict: Dict[str, float], prefix: str):
         self.log_message(f'Metrics for {prefix}, step {self.step}')
         for key, value in metrics_dict.items():
-            self.log_message(f'\t{key} = {value:0.4f}')
+            fmt = '0.6e' if key.endswith('loss_ica') else '0.4f'
+            self.log_message(f'\t{key} = {value:{fmt}}')
 
     def update_step(self, step: int):
         self.step = step

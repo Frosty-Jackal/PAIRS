@@ -18,6 +18,8 @@ optim:
   lambda_pos_reg: 0.0
   lambda_neg_reg: 0.0
   lambda_facial_comp: 0.0
+  lambda_ica: 0.0
+  num_lica_layers: 3
   gan_disc_type: dinov2
   gradient_accumulation_steps: 3
   compute_id_loss_between_identities: false
@@ -40,6 +42,9 @@ model:
   use_shortcuts: false
   use_adain: true
   train_input: false
+  use_set_encoding: false
+  set_encoding_num_inducing: 256
+  set_encoding_up_block_indices: null
   checkpoint_path: ./InstantRestore/final_model_ckpt.pt
 log:
   exp_root: ./experiments
@@ -47,6 +52,7 @@ log:
   log2wandb: true
   val_vis_count: 50
   vis_attention: false
+  debug_l_ica: false
 steps:
   max_steps: 5002
   image_interval: 250

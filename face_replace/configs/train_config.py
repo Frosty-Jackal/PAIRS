@@ -78,6 +78,8 @@ class OptimConfig:
     lambda_pos_reg: float = field(default=0.0)
     lambda_neg_reg: float = field(default=0.0)
     lambda_facial_comp: float = field(default=0.0)
+    lambda_ica: float = field(default=0.0)  # L_ICA: K-semantic weighted attention consistency loss
+    num_lica_layers: int = field(default=3)  # Number of decoder layers to sample per L_ICA forward
     compute_id_loss_between_identities: bool = field(default=False)
     # Parameters related to the learning rate and optimizer
     lr_warmup_steps: int = field(default=100)
@@ -145,6 +147,10 @@ class ModelConfig:
     use_adain: bool = field(default=False)
     # Whether to concat input keys and values in Shared Attention
     train_input: bool = field(default = True)
+    # ── Set-based Identity Encoding (Idea 3) ─────────────────────
+    use_set_encoding: bool = field(default=False)
+    set_encoding_num_inducing: int = field(default=32)
+    set_encoding_up_block_indices: Optional[List[int]] = field(default=None)
 
 
 @dataclass
@@ -162,6 +168,8 @@ class LogConfig:
     val_vis_count: int = field(default=50)
     # Whether to visualize attention maps
     vis_attention: bool = field(default=True)
+    # Whether to print L_ICA debug diagnostics (disabling avoids CUDA sync overhead)
+    debug_l_ica: bool = field(default=False)
 
     @property
     def exp_dir(self) -> Path:

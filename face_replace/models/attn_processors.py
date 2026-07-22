@@ -255,8 +255,9 @@ class SharedAttnProcessor(nn.Module):
             extended_values = value
 
         attention_probs = attn.get_attention_scores(query, extended_keys, attention_mask)
-        if self.save_self_attentions:
-            # Convert the attention_probas back into batch dimension
+        if self.save_self_attentions and getattr(self, '_save_this_step', False):
+            # Only save if this layer was pre-selected (avoids leaking all 9 layers
+            # out of gradient checkpointing — saves ~3-5 GB VRAM).
             self.attention_probs = attention_probs.reshape(batch_size, attn.heads, query.shape[1], extended_keys.shape[1])
             # self.attention_probs = self.attention_probs.float().cpu().detach()
         

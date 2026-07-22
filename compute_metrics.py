@@ -323,7 +323,7 @@ def main():
         t_start = time.time()
         with torch.no_grad():
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                x_pred, _, _ = model.net.forward(
+                x_pred, _, _, _, _ = model.net.forward(
                     inp_t.to(device, dtype),
                     conditioning_images=conds_t.to(device, dtype),
                     valid_indices=valid,

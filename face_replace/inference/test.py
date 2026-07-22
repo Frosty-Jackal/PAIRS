@@ -97,7 +97,7 @@ class Predictor:
                             self_attn_processor.save_self_attentions = True
                     # print("TIME")
                     # start_time = time.time()
-                    x_pred, x_conds, shared_attn_maps = self.face_replace_model.net.forward(
+                    x_pred, x_conds, shared_attn_maps, _ = self.face_replace_model.net.forward(
                         input_images.to(self.device, self.dtype),
                         conditioning_images=conditioning_images.to(self.device, self.dtype),
                         valid_indices=valid_indices,

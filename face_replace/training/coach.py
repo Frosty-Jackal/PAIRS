@@ -174,23 +174,44 @@ class Coach:
             conditioning_images = batch["conditioning_images"].to(self.device, self.weight_dtype)
         
         valid_indices = batch["valid_indices"] if 'valid_indices' in batch else None
-        
+
+        # Pre-select which decoder layers save attention_probs for L_ICA.
+        # Only pre-selected layers leak their attn maps out of gradient checkpointing,
+        # avoiding ~3-5 GB VRAM waste from storing all 9 layers.
+        lica_procs = [p for _, p in self.model.net.unet.attn_processors.items()
+                     if type(p) == SharedAttnProcessor and p.self_attn_idx is not None]
+        if self.cfg.optim.lambda_ica > 0 and len(lica_procs) > 0:
+            n_sample = min(self.cfg.optim.num_lica_layers, len(lica_procs))
+            active_indices = set(random.sample(range(len(lica_procs)), n_sample))
+            for idx, p in enumerate(lica_procs):
+                p._save_this_step = (idx in active_indices)
+                if idx not in active_indices:
+                    p.attention_probs = None  # clear stale ref from previous steps
+        else:
+            # Non-L_ICA mode: all layers save attention_probs (original behaviour).
+            # Other attention-based losses (attn_reg, landmark, pos/neg_reg) need them.
+            for p in lica_procs:
+                p._save_this_step = True
+                p.attention_probs = None  # clear stale
+
         with torch.cuda.amp.autocast():
-            x_tgt_pred, _, shared_attn_probs = self.model.net(
+            x_tgt_pred, _, shared_attn_probs, shared_ref_keys, lica_layer_ids = self.model.net(
                 x_src,
                 face_embeds=face_embeds,
                 conditioning_images=conditioning_images,
                 valid_indices=valid_indices,
                 mask=batch.get("mask", None),
-                return_self_attention_maps=self.cfg.optim.lambda_attn_reg > 0 or 
-                    self.cfg.optim.lambda_landmark > 0 or self.cfg.optim.lambda_pos_reg > 0 or 
-                    self.cfg.optim.lambda_neg_reg > 0,
+                return_self_attention_maps=self.cfg.optim.lambda_attn_reg > 0 or
+                    self.cfg.optim.lambda_landmark > 0 or self.cfg.optim.lambda_pos_reg > 0 or
+                    self.cfg.optim.lambda_neg_reg > 0 or self.cfg.optim.lambda_ica > 0,
             )
-        loss, loss_dict = self.calc_loss(batch=batch, 
-                                            gts=x_tgt, 
+        loss, loss_dict = self.calc_loss(batch=batch,
+                                            gts=x_tgt,
                                             pred=x_tgt_pred,
                                             inp=x_src,
                                             shared_attn_probs=shared_attn_probs,
+                                            shared_ref_keys=shared_ref_keys,
+                                            lica_layer_ids=lica_layer_ids,
                                             gt_attn_probs_masks=gt_attn_probs_masks_layer,
                                             gt_attn_pos_reg_idx=gt_attn_pos_reg_idx,
                                             gt_attn_neg_reg_idx=gt_attn_neg_reg_idx,
@@ -561,16 +582,168 @@ class Coach:
         total_loss += F.mse_loss(reduced_tensor_pred.to(self.weight_dtype), reduced_tensor_gt)
         return total_loss
 
-    def calc_loss(self, 
-                  batch: Dict[str, Any], 
-                  gts: Tensor, 
-                  pred: Tensor, 
+    def _calc_single_layer_ica(self, layer_idx: int, i_ref: int, j_ref: int,
+                               attn_prob: Tensor, ref_key: Tensor) -> Tensor:
+        """Compute L_ICA for a single decoder layer. Return (loss, debug_info_dict)."""
+        B, H, N_q, N_total = attn_prob.shape
+        BH, max_cond, N_k, D = ref_key.shape
+
+        # Compute N_rest (self-attention tokens before reference tokens)
+        N_rest = N_total - max_cond * N_k
+
+        # Sample query tokens to limit memory at high resolutions
+        MAX_QUERY_TOKENS = 256
+        if N_q > MAX_QUERY_TOKENS:
+            q_indices = torch.randperm(N_q, device=attn_prob.device)[:MAX_QUERY_TOKENS]
+            q_indices = q_indices.sort()[0]
+        else:
+            q_indices = slice(None)
+
+        # Slice attention maps for the two chosen reference images
+        k_start_1 = N_rest + i_ref * N_k
+        k_start_2 = N_rest + j_ref * N_k
+        A_r1 = attn_prob[:, :, q_indices, k_start_1:k_start_1 + N_k]
+        A_r2 = attn_prob[:, :, q_indices, k_start_2:k_start_2 + N_k]
+
+        # Min-max normalize to [0, 1]
+        A_r1_min = A_r1.amin(dim=(-2, -1), keepdim=True)
+        A_r1_max = A_r1.amax(dim=(-2, -1), keepdim=True)
+        A_r2_min = A_r2.amin(dim=(-2, -1), keepdim=True)
+        A_r2_max = A_r2.amax(dim=(-2, -1), keepdim=True)
+
+        A_r1_n = (A_r1 - A_r1_min) / (A_r1_max - A_r1_min + 1e-8)
+        A_r2_n = (A_r2 - A_r2_min) / (A_r2_max - A_r2_min + 1e-8)
+
+        # K vectors for the two chosen reference images (detached — frozen weights)
+        K_r1 = ref_key[:, i_ref, :, :].detach()
+        K_r2 = ref_key[:, j_ref, :, :].detach()
+
+        # Cosine similarity weights
+        # clamp=1e-5: negative/unrelated cos_sim -> w≈0 (no gradient), positive -> kept as-is.
+        # No normalization — cross-pose pairs naturally get weaker L_ICA (fewer aligned tokens),
+        # same-pose pairs get stronger L_ICA (more aligned tokens). This is correct behavior.
+        w = F.cosine_similarity(K_r1, K_r2, dim=-1).clamp(min=1e-5)
+
+        # Robust head matching
+        if w.dim() == 1:
+            w = w.unsqueeze(0)
+        w_flat = w.reshape(-1, N_k)
+        if w_flat.shape[0] != B * H:
+            w_flat = w_flat.mean(dim=0, keepdim=True).expand(B * H, -1)
+        w = w_flat.reshape(B, H, N_k)
+
+        # Weighted MSE
+        diff_sq = (A_r1_n - A_r2_n).square()
+        weighted_diff = w.unsqueeze(2) * diff_sq
+        loss_ica = weighted_diff.mean()
+
+        return loss_ica
+
+    def calc_ica_loss(self, shared_attn_probs: List[Tensor], shared_ref_keys: List[Tensor],
+                      lica_layer_ids: List[int] = None) -> Tensor:
+        """
+        L_ICA: K-Semantic Weighted Attention Consistency Loss.
+
+        Layers are pre-selected before forward (coach sets _save_this_step on processors).
+        All data sliced from existing Shared-Attention tensors — zero extra forward passes.
+
+        Args:
+            shared_attn_probs: pre-filtered list of [B, heads, N_query, N_total]
+            shared_ref_keys:   pre-filtered list of [BH, max_cond, N_key, D]
+            lica_layer_ids:     actual decoder self_attn_idx values (for debug logging)
+        """
+        if len(shared_attn_probs) == 0:
+            return torch.tensor(0.0, device='cuda', dtype=torch.float32)
+
+        # Check reference count from first layer
+        _, max_cond, _, _ = shared_ref_keys[0].shape
+        if max_cond < 2:
+            return torch.tensor(0.0, device=shared_attn_probs[0].device, dtype=shared_attn_probs[0].dtype)
+
+        # Pick one pair of reference images (shared across all pre-selected layers)
+        i_ref, j_ref = random.sample(range(max_cond), 2)
+
+        # Use all pre-selected layers (already filtered before forward)
+        losses = []
+        for layer_idx in range(len(shared_attn_probs)):
+            layer_loss = self._calc_single_layer_ica(
+                layer_idx, i_ref, j_ref,
+                shared_attn_probs[layer_idx], shared_ref_keys[layer_idx])
+            losses.append(layer_loss)
+        loss_ica = torch.stack(losses).mean()
+
+        # --- DEBUG: only print first pre-selected layer to avoid spam ---
+        if self.cfg.log.debug_l_ica and self.train_step > 0 and self.train_step % self.cfg.steps.metric_interval == 0:
+            debug_idx = 0
+            attn_prob = shared_attn_probs[debug_idx]
+            ref_key = shared_ref_keys[debug_idx]
+            B, H, N_q, N_total = attn_prob.shape
+            BH, max_cond_debug, N_k, D = ref_key.shape
+            N_rest = N_total - max_cond_debug * N_k
+
+            MAX_QUERY_TOKENS = 256
+            if N_q > MAX_QUERY_TOKENS:
+                q_indices = torch.randperm(N_q, device=attn_prob.device)[:MAX_QUERY_TOKENS].sort()[0]
+            else:
+                q_indices = slice(None)
+
+            k_start_1 = N_rest + i_ref * N_k
+            k_start_2 = N_rest + j_ref * N_k
+            A_r1 = attn_prob[:, :, q_indices, k_start_1:k_start_1 + N_k]
+            A_r2 = attn_prob[:, :, q_indices, k_start_2:k_start_2 + N_k]
+            A_r1_min = A_r1.amin(dim=(-2, -1), keepdim=True)
+            A_r1_max = A_r1.amax(dim=(-2, -1), keepdim=True)
+            A_r2_min = A_r2.amin(dim=(-2, -1), keepdim=True)
+            A_r2_max = A_r2.amax(dim=(-2, -1), keepdim=True)
+            A_r1_n = (A_r1 - A_r1_min) / (A_r1_max - A_r1_min + 1e-8)
+            A_r2_n = (A_r2 - A_r2_min) / (A_r2_max - A_r2_min + 1e-8)
+            diff_sq = (A_r1_n - A_r2_n).square()
+            K_r1 = ref_key[:, i_ref, :, :].detach()
+            K_r2 = ref_key[:, j_ref, :, :].detach()
+            w_raw = F.cosine_similarity(K_r1, K_r2, dim=-1)
+            w = w_raw.clamp(min=1e-5)
+
+            A_r1_raw_mean = A_r1.mean().item()
+            A_r1_raw_max = A_r1.max().item()
+            diff_mean = (A_r1_n - A_r2_n).abs().mean().item()
+            diff_max = (A_r1_n - A_r2_n).abs().max().item()
+            diff_sq_mean = diff_sq.mean().item()
+            w_mean = w.mean().item()
+            w_max = w.max().item()
+            w_frac_high = (w_raw > 0.5).float().mean().item()
+            w_frac_mid = ((w_raw > 0.2) & (w_raw <= 0.5)).float().mean().item()
+            w_frac_neg = (w_raw <= 0.0).float().mean().item()
+            loss_ica_unweighted = diff_sq.mean().item()
+            loss_ica_val = loss_ica.item()
+
+            layer_ids_str = str(lica_layer_ids) if lica_layer_ids else f"[0..{len(shared_attn_probs)-1}]"
+            print(f"\n[L_ICA DEBUG step={self.train_step}] layers={layer_ids_str} refs=({i_ref},{j_ref}) "
+                  f"(showing idx {debug_idx})")
+            print(f"  A_raw:        mean={A_r1_raw_mean:.2e}  max={A_r1_raw_max:.2e}")
+            print(f"  A_norm diff:  mean_abs={diff_mean:.6f}  max_abs={diff_max:.6f}  mse={diff_sq_mean:.6f}")
+            print(f"  w (cos_sim):  mean={w_mean:.4f}  max={w_max:.4f}")
+            print(f"  w distribution: >0.5={w_frac_high:.3f}  0.2~0.5={w_frac_mid:.3f}  <=0{w_frac_neg:.3f}")
+            print(f"  L_ICA (all {len(shared_attn_probs)} layers avg): unweighted_first={loss_ica_unweighted:.8f}  weighted={loss_ica_val:.8f}")
+            print(f"  lambda*L_ICA:       {self.cfg.optim.lambda_ica * loss_ica_val:.6f}")
+            w_sample = w[0, :8].detach().cpu().tolist()
+            diff_sample = diff_sq[0, 0, 0, :8].detach().cpu().tolist()
+            print(f"  head0 top8:   w={[f'{v:.4f}' for v in w_sample]}")
+            print(f"                diff^2={[f'{v:.6f}' for v in diff_sample]}")
+
+        return loss_ica
+
+    def calc_loss(self,
+                  batch: Dict[str, Any],
+                  gts: Tensor,
+                  pred: Tensor,
                   inp: Tensor,
                   shared_attn_probs: List[Tensor] = None,
+                  shared_ref_keys: List[Tensor] = None,
                   gt_attn_probs_masks: Tuple[List[Tensor],List[Tensor],List[int],List[int]] = None,
                   gt_attn_pos_reg_idx: List[int] = None,
                   gt_attn_neg_reg_idx: List[int] = None,
-                  gt_facial_comps: Tuple[Tensor] = None) -> Tuple[Tensor, Dict[str, float]]:
+                  gt_facial_comps: Tuple[Tensor] = None,
+                  lica_layer_ids: List[int] = None) -> Tuple[Tensor, Dict[str, float]]:
         loss_dict = {}
         if self.cfg.optim.lambda_l1 > 0:
             loss_rec = F.l1_loss(pred.float(), gts.float(), reduction="mean")
@@ -616,7 +789,12 @@ class Coach:
             loss_attn_reg = sum(reg_losses) / len(reg_losses)
             loss_dict['loss_attn_reg'] = loss_attn_reg.item()
             loss += loss_attn_reg * self.cfg.optim.lambda_attn_reg
-        
+
+        if self.cfg.optim.lambda_ica > 0 and shared_attn_probs is not None and shared_ref_keys is not None:
+            loss_ica = self.calc_ica_loss(shared_attn_probs, shared_ref_keys, lica_layer_ids)
+            loss_dict['loss_ica'] = loss_ica.item()
+            loss += loss_ica * self.cfg.optim.lambda_ica
+
         if self.cfg.optim.lambda_cycle > 0 and batch["degrade_transforms"] is not None:
             degrade_transforms = batch["degrade_transforms"]
             loss_cycle = 0

@@ -1,5 +1,7 @@
+import math
 import numpy as np
 import torch
+import torch.nn as nn
 from diffusers import AutoencoderKL
 from diffusers.utils import is_xformers_available
 from peft import LoraConfig
@@ -12,6 +14,93 @@ from face_replace.models.model import make_1step_sched, my_vae_encoder_fwd, my_v
 from face_replace.models.unet_2d_condition.unet import UNet2DConditionModel
 
 import time
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Set-based Identity Encoding (Idea 3)
+# ═══════════════════════════════════════════════════════════════════
+
+class SetIdentityEncoder(nn.Module):
+    """PMA-based set identity encoder.
+
+    Flattens reference ResBlock features across K reference images into an
+    unordered set of tokens, compresses them via cross-attention with M
+    learnable inducing points, then produces a per-channel delta [B, C, 1, 1]
+    for ADD-injection into the generation UNet at the corresponding layer.
+
+    Parameters
+    ----------
+    feat_dim : int
+        Number of channels at this UNet scale (e.g. 1280, 640, 320).
+    num_inducing : int
+        Number of learnable inducing points M (default 32).
+    num_heads : int
+        Number of attention heads for the cross-attention (default 8).
+    """
+
+    def __init__(self, feat_dim: int, num_inducing: int = 32, num_heads: int = 8):
+        super().__init__()
+        self.feat_dim = feat_dim
+        self.num_inducing = num_inducing
+
+        # Learnable inducing points S ∈ R^{M × C}
+        self.inducing = nn.Parameter(torch.randn(num_inducing, feat_dim) * 0.02)
+
+        # PMA: cross-attention — S queries, flattened tokens as keys/values
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=feat_dim,
+            num_heads=num_heads,
+            batch_first=True,
+        )
+
+        # ── Learned aggregation over M inducing points ──────────────
+        # mean() discards the specialisation that inducing points learn.
+        # Instead: a lightweight gating network learns to weight each
+        # inducing point's contribution before summing.
+        self.aggregator = nn.Sequential(
+            nn.Linear(feat_dim, feat_dim // 4),
+            nn.GELU(),
+            nn.Linear(feat_dim // 4, 1),
+        )
+
+        # Zero-initialised 1×1 conv for stable training (cf. ControlNet)
+        self.zero_conv = nn.Conv2d(feat_dim, feat_dim, kernel_size=1)
+        nn.init.zeros_(self.zero_conv.weight)
+        nn.init.zeros_(self.zero_conv.bias)
+
+    def forward(self, ref_feats):
+        """
+        Parameters
+        ----------
+        ref_feats : list of K tensors
+            Each tensor has shape [B, C, H, W] from one reference image.
+            K = max_conditioning_images (e.g. 3).
+
+        Returns
+        -------
+        delta : torch.Tensor
+            [B, C, 1, 1] — broadcastable identity delta for ADD injection.
+        """
+        B = ref_feats[0].shape[0]
+
+        # Step 1: flatten each ref feature map → [B, HW, C]
+        tokens_list = [f.flatten(2).transpose(1, 2) for f in ref_feats]
+        # Step 2: concatenate across reference images → [B, K×HW, C]
+        tokens = torch.cat(tokens_list, dim=1)  # [B, K*HW, C]
+
+        # Step 3: PMA — inducing points attend to the unordered token set
+        S = self.inducing.unsqueeze(0).expand(B, -1, -1)  # [B, M, C]
+        Z, _ = self.cross_attn(S, tokens, tokens)          # [B, M, C]
+
+        # Step 4: learned weighted aggregation → [B, C]
+        # Each inducing point learns to detect a different identity
+        # attribute; the aggregator learns how important each one is.
+        weights = self.aggregator(Z).sigmoid()  # [B, M, 1]
+        z_id = (Z * weights).sum(dim=1)              # [B, C]
+
+        # Step 5: zero-initialised 1×1 conv → [B, C, 1, 1]
+        delta = self.zero_conv(z_id.unsqueeze(-1).unsqueeze(-1))  # [B, C, 1, 1]
+        return delta
 
 
 MODEL_NAME = 'stabilityai/sd-turbo'
@@ -32,6 +121,12 @@ class Pix2Pix_Turbo(torch.nn.Module):
         super().__init__()
 
         self.cfg = cfg
+
+        # ── Set-encoding state ──────────────────────────────────────
+        self._ref_up_block_features: list = []     # captured from Ref UNet
+        self._set_deltas: list = []                # computed deltas for Gen UNet
+        self._ref_hook_handles: list = []          # forward-hook handles on Ref UNet
+        self._gen_hook_handles: list = []          # forward-hook handles on Gen UNet
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, subfolder="tokenizer")
         self.sched = make_1step_sched(model_name=MODEL_NAME)
 
@@ -96,6 +191,9 @@ class Pix2Pix_Turbo(torch.nn.Module):
 
         register_attention_processor_kv_unet(self.original_unet)
         register_attention_processor(self.unet, cfg=cfg, save_self_attentions=save_self_attentions)
+
+        # ── Set-based Identity Encoding ─────────────────────────────
+        self._init_set_encoders(cfg)
 
         prompt = "A high-quality photo of a person; professional, 8k"
         caption_tokens = self.tokenizer(prompt,
@@ -187,6 +285,145 @@ class Pix2Pix_Turbo(torch.nn.Module):
                                                        target_modules=target_modules_unet)
                 self.original_unet.add_adapter(original_unet_lora_config)
 
+    # ═══════════════════════════════════════════════════════════════
+    # Set-based Identity Encoding — setup, hooks, helpers
+    # ═══════════════════════════════════════════════════════════════
+
+    def _init_set_encoders(self, cfg: ModelConfig):
+        """Create SetIdentityEncoder modules and register forward hooks.
+
+        Hooks on the **Reference UNet** up_blocks capture intermediate
+        features during ``get_conditioning_keys_values``.
+
+        Hooks on the **Generation UNet** up_blocks inject the computed
+        deltas during the main forward pass.
+
+        The up_block indices and per-scale channel counts are read from
+        the actual UNet config, so they are always correct for whichever
+        SD variant is loaded.
+        """
+        if not getattr(cfg, 'use_set_encoding', False):
+            self.set_encoders = nn.ModuleList()
+            return
+
+        # ── determine which up_blocks to hook ──────────────────────
+        # By default hook all up blocks for multi-scale identity injection.
+        default_indices = list(range(len(self.original_unet.up_blocks)))
+        block_indices = getattr(cfg, 'set_encoding_up_block_indices', None)
+        if block_indices is None:
+            block_indices = default_indices
+        elif len(block_indices) == 0:
+            self.set_encoders = nn.ModuleList()
+            return
+
+        num_inducing = getattr(cfg, 'set_encoding_num_inducing', 32)
+
+        # Read channel counts from the actual model
+        reversed_channels = list(reversed(self.original_unet.config.block_out_channels))
+        # reversed_channels[i] is the *output* channel of up_blocks[i]
+
+        self._set_block_indices = block_indices
+
+        encoders = []
+        for idx in block_indices:
+            feat_dim = reversed_channels[idx]
+            enc = SetIdentityEncoder(
+                feat_dim=feat_dim,
+                num_inducing=num_inducing,
+            )
+            encoders.append(enc)
+
+        self.set_encoders = nn.ModuleList(encoders)
+
+        # ── register forward hooks ─────────────────────────────────
+        self._register_ref_hooks(block_indices)
+        self._register_gen_hooks(block_indices)
+
+        print(f"[SetIdentityEncoder] Hooking up_blocks {block_indices} "
+              f"with channel dims {[reversed_channels[i] for i in block_indices]}, "
+              f"M={num_inducing}")
+
+    def _register_ref_hooks(self, block_indices):
+        """Capture up_block outputs from the Reference UNet."""
+        self._remove_hooks(self._ref_hook_handles)
+        self._ref_up_block_features = [None] * len(self.original_unet.up_blocks)
+
+        def _make_capture_hook(blk_idx):
+            def hook(module, input, output):
+                self._ref_up_block_features[blk_idx] = output.detach()
+            return hook
+
+        for idx in block_indices:
+            handle = self.original_unet.up_blocks[idx].register_forward_hook(
+                _make_capture_hook(idx)
+            )
+            self._ref_hook_handles.append(handle)
+
+    def _register_gen_hooks(self, block_indices):
+        """Inject deltas into the Generation UNet up_block outputs."""
+        self._remove_hooks(self._gen_hook_handles)
+        self._set_deltas = [None] * len(self.unet.up_blocks)
+
+        def _make_inject_hook(blk_idx):
+            def hook(module, input, output):
+                delta = self._set_deltas[blk_idx]
+                if delta is not None:
+                    # delta is [B, C, 1, 1]; broadcast-add to [B, C, H, W]
+                    return output + delta.to(dtype=output.dtype)
+                return output
+            return hook
+
+        for idx in block_indices:
+            handle = self.unet.up_blocks[idx].register_forward_hook(
+                _make_inject_hook(idx)
+            )
+            self._gen_hook_handles.append(handle)
+
+    @staticmethod
+    def _remove_hooks(handle_list):
+        for h in handle_list:
+            h.remove()
+        handle_list.clear()
+
+    def _compute_set_deltas(self, batch_size: int):
+        """Run PMA on captured reference features to get per-scale deltas.
+
+        Called once per forward pass, after ``get_conditioning_keys_values``
+        has populated ``self._ref_up_block_features``.
+
+        Parameters
+        ----------
+        batch_size : int
+            Original batch size B (before K-reference flattening).
+        """
+        if not self.set_encoders:
+            self._set_deltas = [None] * len(self.unet.up_blocks)
+            return
+
+        for enc_idx, blk_idx in enumerate(self._set_block_indices):
+            raw = self._ref_up_block_features[blk_idx]
+            if raw is None:
+                self._set_deltas[blk_idx] = None
+                continue
+
+            # raw shape: [B*K, C, H, W]  →  reshape to per-sample list
+            C = raw.shape[1]
+            K = raw.shape[0] // batch_size  # number of ref images per sample
+
+            ref_feats = []
+            for k in range(K):
+                ref_feats.append(raw[k::K].contiguous())  # [B, C, H, W]
+
+            delta = self.set_encoders[enc_idx](ref_feats)  # [B, C, 1, 1]
+            self._set_deltas[blk_idx] = delta
+
+    def _clear_ref_features(self):
+        self._ref_up_block_features = [None] * len(self.original_unet.up_blocks)
+
+    # ═══════════════════════════════════════════════════════════════
+    # End Set-encoding helpers
+    # ═══════════════════════════════════════════════════════════════
+
     def set_eval(self):
         self.unet.eval()
         self.original_unet.eval()
@@ -196,6 +433,8 @@ class Pix2Pix_Turbo(torch.nn.Module):
         self.original_unet.requires_grad_(False)
         self.vae.requires_grad_(False)
         self.original_vae.requires_grad_(False)
+        if self.set_encoders:
+            self.set_encoders.eval()
 
     def set_train(self):
         self.unet.train()
@@ -239,6 +478,13 @@ class Pix2Pix_Turbo(torch.nn.Module):
             for n, _p in self.original_vae.named_parameters():
                 _p.requires_grad = False
 
+        # ── Set-encoding parameters always trainable ──────────────
+        if self.set_encoders:
+            self.set_encoders.train()
+            for enc in self.set_encoders:
+                for _p in enc.parameters():
+                    _p.requires_grad = True
+
     def get_conditioning_keys_values(self, conditioning_images, valid_indices):
         # Extract the keys and values from the conditioning images and use this to inject into the unet
         cond = conditioning_images.reshape(-1, 3, 512, 512)
@@ -251,6 +497,9 @@ class Pix2Pix_Turbo(torch.nn.Module):
         model_input = self.sched.scale_model_input(noisy_encoded_condition, timesteps)
 
         extended_caption_enc = self.caption_enc.repeat(model_input.shape[0], 1, 1)
+
+        # ── Clear stored ref features so hooks capture fresh ones ──
+        self._clear_ref_features()
 
         model_pred_condition = self.original_unet(model_input,
                                                   t,
@@ -313,6 +562,11 @@ class Pix2Pix_Turbo(torch.nn.Module):
         # print(f"Preprocessing: {time.time() - start_time}")
         # start_time = time.time()
 
+        # ── Compute set-encoding deltas before Gen UNet forward ──
+        if conditioning_images is not None and self.set_encoders:
+            B = c_t.shape[0]
+            self._compute_set_deltas(B)
+
         if self.condition_on_face_embeds and face_embeds is not None:
             model_pred = self.unet(model_input,
                                     t,
@@ -336,11 +590,16 @@ class Pix2Pix_Turbo(torch.nn.Module):
         # start_time = time.time()
 
         if return_self_attention_maps:
-            shared_attn_maps = [p.attention_probs for p in self.unet.attn_processors.values() 
-                                if type(p) == SharedAttnProcessor and p.self_attn_idx is not None]
-            return output_image, output_image_conditions, shared_attn_maps
+            shared_attn_maps = []
+            selected_indices = []
+            for p in self.unet.attn_processors.values():
+                if type(p) == SharedAttnProcessor and p.self_attn_idx is not None and p.attention_probs is not None:
+                    shared_attn_maps.append(p.attention_probs)
+                    selected_indices.append(p.self_attn_idx)
+            ref_k_list = [keys_[idx] for idx in selected_indices] if selected_indices else []
+            return output_image, output_image_conditions, shared_attn_maps, ref_k_list, selected_indices
         else:
-            return output_image, output_image_conditions, None
+            return output_image, output_image_conditions, None, None, None
 
     def save_model(self, outf):
         sd = {}
@@ -350,4 +609,11 @@ class Pix2Pix_Turbo(torch.nn.Module):
         sd["rank_vae"] = self.lora_rank_vae
         sd["state_dict_unet"] = {k: v for k, v in self.unet.state_dict().items() if "lora" in k or "conv_in" in k}
         sd["state_dict_vae"] = {k: v for k, v in self.vae.state_dict().items() if "lora" in k or "skip" in k}
+        # ── Set-encoding weights ──────────────────────────────────
+        if self.set_encoders:
+            sd["state_dict_set_encoders"] = {
+                f"set_encoder_{i}": enc.state_dict()
+                for i, enc in enumerate(self.set_encoders)
+            }
+            sd["set_block_indices"] = self._set_block_indices
         torch.save(sd, outf)
