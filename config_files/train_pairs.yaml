@@ -33,8 +33,8 @@ optim:
   mixed_precision: true
   gradient_checkpointing: false
 data:
-  data_root: ./CelebRefHQHR/train
-  val_data_root: ./CelebRefHQHR/val
+  data_root: /path/to/your/train_dataset
+  val_data_root: /path/to/your/val_dataset
   dataset_type: face_restore
   max_conditioning_images: 2    # L_ICA requires >= 2 refs per identity
   store_landmarks: false
@@ -49,7 +49,7 @@ model:
   use_shortcuts: false
   use_adain: true
   train_input: true             # Shared-Attention concat mode (required for L_ICA)
-  checkpoint_path: ./InstantRestore/final_model_ckpt.pt
+  checkpoint_path: /path/to/your/checkpoint.ckpt
   # ── Set-based Identity Encoding ──────────────────────────────────
   use_set_encoding: true
   set_encoding_num_inducing: 256   # M=256 inducing points for PIE
