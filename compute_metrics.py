@@ -1,8 +1,8 @@
 """
-compute_metrics.py — Evaluate all metrics on CelebRefHQHR test set for HrRestore paper.
+compute_metrics.py — Evaluate all metrics on CelebRefHQ test set for PAIRS paper.
 
 Usage:
-    python compute_metrics.py --checkpoint path/to/final_model_ckpt.pt [--data-root ./CelebRefHQHR/test] [--output-dir ./metrics]
+    python compute_metrics.py --checkpoint path/to/final_model_ckpt.pt [--data-root ./CelebRefHQ/test] [--output-dir ./metrics]
     python compute_metrics.py --checkpoint ckpt.pt --metrics lpips,psnr,ssim
     python compute_metrics.py --checkpoint ckpt.pt --metrics all   (default)
 
@@ -163,11 +163,11 @@ def compute_id_similarity(pred_tensor: torch.Tensor, gt_tensor: torch.Tensor, id
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Multi-metric evaluation for HrRestore")
+    parser = argparse.ArgumentParser(description="Multi-metric evaluation for PAIRS")
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to the model checkpoint, e.g. final_model_ckpt.pt")
-    parser.add_argument("--data-root", type=str, default="./CelebRefHQHR/test",
-                        help="Root of the CelebRefHQHR test folder (contains x4, x8, x16)")
+    parser.add_argument("--data-root", type=str, default="./CelebRefHQ/test",
+                        help="Root of the CelebRefHQ test folder (contains x4, x8, x16)")
     parser.add_argument("--output-dir", type=str, default="./metrics",
                         help="Directory to write results into")
     parser.add_argument("--device", type=str, default="cuda",
@@ -437,7 +437,7 @@ def main():
     overall_txt = output_dir / "metrics_overall.txt"
     with open(overall_txt, "w") as f:
         f.write("=" * 65 + "\n")
-        f.write("HrRestore Evaluation — CelebRefHQHR test\n")
+        f.write("PAIRS Evaluation — CelebRefHQ test\n")
         f.write("=" * 65 + "\n\n")
         f.write(f"Checkpoint: {args.checkpoint}\n")
         f.write(f"Total samples evaluated: {len(all_results)}\n\n")
